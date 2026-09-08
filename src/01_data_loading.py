@@ -216,10 +216,10 @@ def _build_fake_chbmit_file(tmp_dir):
 
 
 if __name__ == "__main__":
-    DATA_DIR = "./fake_data_for_testing"  # <-- point this at real chb01/ once you have it
+    DATA_DIR = "E:\Ph.D\DB\CHB\chb-mit-scalp-eeg-database-1.0.0\chb01"  # <-- point this at real chb01/ once you have it
 
-    print("Building a synthetic stand-in recording (no internet access here)...")
-    edf_path, summary_path = _build_fake_chbmit_file(DATA_DIR)
+   summary_path = os.path.join(DATA_DIR, "chb01-summary.txt")
+   edf_path = os.path.join(DATA_DIR, "chb01_03.edf")
 
     print("\n--- Step 1: parsing summary.txt ---")
     seizures_by_file = parse_summary(summary_path)
