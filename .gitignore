@@ -1,0 +1,5 @@
+data/
+fake_data_for_testing/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
