@@ -37,6 +37,7 @@ import os
 import re
 import numpy as np
 import mne
+import glob
 
 # MNE is quite chatty by default (prints info on every call).
 # We quiet it down here so our own print statements are easy to read.
@@ -216,32 +217,38 @@ def _build_fake_chbmit_file(tmp_dir):
 
 
 if __name__ == "__main__":
-    DATA_DIR = "E:\Ph.D\DB\CHB\chb-mit-scalp-eeg-database-1.0.0\chb01"  # <-- point this at real chb01/ once you have it
+    DATA_DIR = "E:\Ph.D\DB\CHB\chb-mit-scalp-eeg-database-1.0.0"  
 
+    for i in range(1, 25):
+        patient_folder = os.path.join(DATA_DIR, f"chb{i:02d}")
+        summary_path = os.path.join(patient_folder, f"chb{i:02d}-summary.txt")
 
-    summary_path = os.path.join(DATA_DIR, "chb01-summary.txt")
-    edf_path = os.path.join(DATA_DIR, "chb01_03.edf")
+        if not os.path.exists(summary_path):
+            print(f"Skipping chb{i:02d} — no summary file found")
+            continue
 
-    print("\n--- Step 1: parsing summary.txt ---")
-    seizures_by_file = parse_summary(summary_path)
-    print(seizures_by_file)
+        seizures_by_file = parse_summary(summary_path)
+        edf_files = glob.glob(os.path.join(patient_folder, "*.edf"))
+        print(
+            f"\nchb{i:02d}: found {len(edf_files)} edf files, "
+            f"{len(seizures_by_file)} contain seizures"
+        )
 
-    print("\n--- Step 2: loading the .edf file ---")
-    raw = load_edf(edf_path)
-    print(f"Loaded {len(raw.ch_names)} channels at {raw.info['sfreq']} Hz, "
-          f"{raw.n_times} total samples")
+        print("\n--- Step 2: loading the .edf file ---")
+        for edf_path in edf_files:
+            filename = os.path.basename(edf_path)
 
-    print("\n--- Step 3: preprocessing (notch + band-pass filter) ---")
-    raw = preprocess_raw(raw)
-    print("Filtering complete.")
+            if filename not in seizures_by_file:
+                continue  # skip files with no seizures, for now
 
-    print("\n--- Step 4: cutting seizure epochs ---")
-    filename = os.path.basename(edf_path)
-    epochs = get_seizure_epochs(raw, seizures_by_file[filename])
-    for i, epoch in enumerate(epochs):
-        print(f"Seizure epoch {i}: shape = {epoch.shape} "
-              f"(n_channels, n_samples)")
+            print("\n--- Step 3: preprocessing (notch + band-pass filter) ---")
+            try:
+                raw = preprocess_raw(load_edf(edf_path))
+                epochs = get_seizure_epochs(raw, seizures_by_file[filename])
+                for epoch_i, epoch in enumerate(epochs):
+                    print(f"  {filename} seizure {epoch_i}: shape = {epoch.shape}")
+                print("Filtering complete.")
+            except Exception as e:
+                print(f"  !! Skipping {filename} — failed with: {e}")
 
-    print("\nAll steps ran successfully on real chb01 data.")
-    print("Next: download a real chb01 folder from PhysioNet and point "
-          "DATA_DIR at it to see this run on genuine EEG.")
+            print("\nAll steps complete for this file.")
