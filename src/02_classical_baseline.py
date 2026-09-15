@@ -49,6 +49,7 @@ import glob
 import numpy as np
 import mne
 from scipy.signal import welch
+from sklearn.preprocessing import StandardScaler
 
 # NumPy renamed trapz -> trapezoid in version 2.0. This line picks
 # whichever name is actually available, so the script works on either
@@ -219,6 +220,61 @@ def extract_features(epoch_data, sfreq):
 
 
 # ---------------------------------------------------------------------------
+# NEW: sampling enough negative (non-seizure) epochs to balance the classes
+# ---------------------------------------------------------------------------
+def extract_negative_epochs(
+    non_seizure_files, n_needed, window_sec, start_offset_sec=60, stride_sec=120
+):
+    """
+    Pull up to n_needed non-overlapping windows from a patient's
+    seizure-free files, instead of just one. This directly fixes the
+    class-imbalance problem found by inspecting the LOSO results:
+    with only one negative example per patient but many positive
+    ones, a model can score deceptively well just by predicting
+    "seizure" most of the time.
+
+    start_offset_sec : skip this many seconds at the start of each
+        file, since recording artifacts are more common right at
+        the beginning.
+    stride_sec : how far apart consecutive windows are spaced within
+        the same file, so they don't overlap and aren't just
+        near-duplicates of each other.
+
+    Returns
+    -------
+    list of (epoch_data, sfreq) tuples -- sfreq is returned alongside
+    each epoch since extract_features() needs it.
+    """
+    epochs = []
+
+    for edf_path in non_seizure_files:
+        if len(epochs) >= n_needed:
+            break
+        try:
+            raw = preprocess_raw(load_edf(edf_path))
+            raw = dedupe_and_rename_channels(raw)
+            raw = select_common_channels(raw)
+        except ValueError as e:
+            print(f"Skipping {os.path.basename(edf_path)} - {e}")
+            continue
+
+        sfreq = raw.info['sfreq']
+        data = raw.get_data()
+        total_samples = data.shape[1]
+
+        offset_sec = start_offset_sec
+        while len(epochs) < n_needed:
+            start_sample = int(offset_sec * sfreq)
+            end_sample = start_sample + int(window_sec * sfreq)
+            if end_sample > total_samples:
+                break  # ran out of room in this file -- move to the next one
+            epochs.append((data[:, start_sample:end_sample], sfreq))
+            offset_sec += stride_sec  # move to the next non-overlapping window
+            
+    return epochs
+
+
+# ---------------------------------------------------------------------------
 # NEW: building the dataset across multiple patients
 # ---------------------------------------------------------------------------
 def build_dataset(root_data_dir):
@@ -252,7 +308,13 @@ def build_dataset(root_data_dir):
         seizure_files = [f for f in all_eds if os.path.basename(f) in seizures_by_file]
         non_seizure_files = [f for f in all_eds if os.path.basename(f) not in seizures_by_file]
 
+        # Collect this patient's rows separately first, so we can
+        # normalize them against THIS patient's own baseline before
+        # adding them to the shared dataset -- see note below.
+        X_patient, y_patient = [], []
+
         # --- Positive examples: one epoch per seizure ---
+        n_positive_this_patient = 0
         for edf_path in seizure_files:
             file_name = os.path.basename(edf_path)
             try:
@@ -271,33 +333,35 @@ def build_dataset(root_data_dir):
                 epoch = data[:, start_sample:end_sample]
                 if epoch.shape[1] < sfreq:
                     continue  # skip if not enough samples for a full epoch
-                X.append(extract_features(epoch, sfreq))
-                y.append(1)
-                groups.append(patient_id)
+                X_patient.append(extract_features(epoch, sfreq))
+                y_patient.append(1)
+                n_positive_this_patient += 1
 
-        # --- Negative examples: one epoch from a seizure-free file ---
-        if non_seizure_files:
-            edf_path = non_seizure_files[0]
-            try:
-                raw = preprocess_raw(load_edf(edf_path))
-                raw = dedupe_and_rename_channels(raw)
-                raw = select_common_channels(raw)
-            except ValueError as e:
-                print(f"Skipping {edf_path} for patient {patient_id}: {e}")
-                raw = None
-            if raw is None:
-                continue
-            sfreq = raw.info["sfreq"]
-            data = raw.get_data()
-            # Grab a window from partway into the file, avoiding the
-            # very start where recording artifacts are more common.
-            start_sample = int(60 * sfreq)
-            end_sample = start_sample + int(WINDOW_SEC * sfreq)
-            if end_sample <= data.shape[1]:
-                epoch = data[:, start_sample:end_sample]
-                X.append(extract_features(epoch, sfreq))
-                y.append(0)
-                groups.append(patient_id)
+        # --- Negative examples: sample enough windows to roughly balance this patient ---
+        n_negative_needed = max(n_positive_this_patient, 1)  # at least one negative example
+        for epoch_data, sfreq in extract_negative_epochs(non_seizure_files, n_negative_needed, WINDOW_SEC):
+            X_patient.append(extract_features(epoch, sfreq))
+            y_patient.append(0)
+
+        if not X_patient:
+            continue
+
+        # --- Subject-wise normalization ---
+        # Z-score this patient's features using ONLY their own mean
+        # and standard deviation, computed across their own epochs.
+        # This does not use any other patient's data, and does not
+        # use label information -- it only corrects for this one
+        # person's overall baseline scale, which is exactly the
+        # between-patient difference that global (fold-level)
+        # standardization couldn't see or fix.
+        X_patient = np.array(X_patient)
+        patient_mean = X_patient.mean(axis=0)
+        patient_std = X_patient.std(axis=0) + 1e-10  # avoid divide-by-zero
+        X_patient = (X_patient - patient_mean) / patient_std
+
+        X.extend(X_patient)
+        y.extend(y_patient)
+        groups.extend([patient_id] * len(y_patient))
 
     return np.array(X), np.array(y), np.array(groups)
 
@@ -320,9 +384,21 @@ def run_loso_cv(X, y, groups):
         y_train, y_test = y[train_idx], y[test_idx]
         held_out_patient = groups[test_idx][0]  # all test indices have the same patient ID
 
+        scaler = StandardScaler()
+        X_train = scaler.fit_transform(X_train)      # learn mean/std from training patients only
+        X_test = scaler.transform(X_test)             # apply those same stats to the held-out patient
+
         clf = RandomForestClassifier(n_estimators=100, random_state=42)
         clf.fit(X_train, y_train)
         y_pred = clf.predict(X_test)
+
+        # --- TEMPORARY DIAGNOSTIC: confirm what the model is actually predicting ---
+        unique_preds, pred_counts = np.unique(y_pred, return_counts=True)
+        print(
+            f"    [debug] predicted labels for this fold: "
+            f"{dict(zip(unique_preds, pred_counts))}  "
+            f"(true labels were: {dict(zip(*np.unique(y_test, return_counts=True)))})"
+        )
 
         acc = accuracy_score(y_test, y_pred)
         # zero_division=0 avoids warnings when a fold has only one class present
@@ -411,17 +487,48 @@ def _build_fake_multi_patient_dataset(root_dir, n_patients=3):
 
 if __name__ == "__main__":
     ROOT_DATA_DIR = "E:\Ph.D\DB\CHB\chb-mit-scalp-eeg-database-1.0.0"  # <-- point this at your local CHB-MIT folder
-    
+
     print("\n--- Building feature dataset across all patients ---")
     X, y, groups = build_dataset(ROOT_DATA_DIR)
     print(f"X shape: {X.shape}  (n_epochs, n_features)")
     print(f"y: {y}  (1 = seizure, 0 = non-seizure)")
     print(f"groups: {groups}")
 
+    # --- TEMPORARY DIAGNOSTIC: sanity-check the feature matrix itself ---
+    print(f"\n[debug] Any NaN in X? {np.isnan(X).any()}")
+    print(f"[debug] Any Inf in X? {np.isinf(X).any()}")
+    # Coefficient of variation (std / mean) instead of raw variance --
+    # this is scale-independent, so band-power features (naturally
+    # tiny, ~1e-10) and line-length features (naturally much larger)
+    # can be judged fairly on the same footing.
+    feature_means = X.mean(axis=0)
+    feature_stds = X.std(axis=0)
+    coef_var = feature_stds / (
+        np.abs(feature_means) + 1e-30
+    )  # tiny epsilon avoids divide-by-zero
+
+    band_power_cv = coef_var[:90]  # first 90 features: 5 bands x 18 channels
+    line_length_cv = coef_var[90:]  # last 18 features: 1 x 18 channels
+
+    print(
+        f"[debug] Band-power coefficient of variation -- "
+        f"min: {band_power_cv.min():.4f}, max: {band_power_cv.max():.4f}, "
+        f"mean: {band_power_cv.mean():.4f}"
+    )
+    print(
+        f"[debug] Line-length coefficient of variation -- "
+        f"min: {line_length_cv.min():.4f}, max: {line_length_cv.max():.4f}, "
+        f"mean: {line_length_cv.mean():.4f}"
+    )
+    print(
+        f"[debug] Features with near-zero RELATIVE variation (CV < 0.05): "
+        f"{(coef_var < 0.05).sum()} out of {X.shape[1]}"
+    )
+
     print("\n--- Running Leave-One-Subject-Out cross-validation ---")
     run_loso_cv(X, y, groups)
 
-    print("\nAll steps ran successfully on synthetic data.")
+    print("\nAll steps complete.")
     print(
         "Next: point ROOT_DATA_DIR at your real chb-mit/ folder "
         "(with multiple chbXX subfolders) to get a meaningful result."
